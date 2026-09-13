@@ -177,6 +177,7 @@ const UINT WM_APP_CELL     = WM_APP + 1;   // wParam = dots, lParam = QPC when p
 const UINT WM_APP_PLAINKEY = WM_APP + 2;   // a non-dot key went down: forget the half-typed cell
 const UINT WM_APP_HOOK     = WM_APP + 3;   // wParam = 1 install, 0 remove (hook thread)
 const UINT WM_APP_REFRESH  = WM_APP + 4;   // main thread: reconsider whether the hook should exist
+const UINT WM_APP_TOGGLE  = WM_APP + 5;   // Ctrl+F12 came through the hook, not RegisterHotKey
 const UINT WM_APP_MODE     = WM_APP + 5;   // mode thread: ask the IME again; wParam = reason (static string), lParam = delay ms
 
 const ULONG_PTR kOurMark = 0x4B4C5242;     // 'BRLK' on every key we inject
@@ -404,6 +405,7 @@ ModeInfo CachedMode(long* waitedUs) {
 // rule), and speech never holds a cell back.
 struct SpeechSlot {
     std::wstring text;
+    bool state = false;         // about the mode itself (opened / closed), not typing feedback
     bool refuse = false;        // play the refusal sound first
     bool reset = false;         // JAWS went away: drop the COM object
     bool quit = false;
@@ -416,9 +418,10 @@ JawsCom    g_jaws;              // speech thread only
 
 bool JawsRunning() { return JawsProcessRunning(); }   // by process, not window: see jaws_presence.h
 
-void Say(const wchar_t* s, unsigned delayMs = 0) {
+void Say(const wchar_t* s, unsigned delayMs = 0, bool state = false) {
     AcquireSRWLockExclusive(&g_sayLock);
     g_say.text = s;
+    g_say.state = state;
     g_say.notBefore = delayMs ? GetTickCount64() + delayMs : 0;
     ReleaseSRWLockExclusive(&g_sayLock);
     SetEvent(g_sayEvent);
@@ -454,11 +457,19 @@ DWORD WINAPI SpeechThread(LPVOID) {
                 continue;
             }
             s = g_say;
-            g_say.text.clear(); g_say.refuse = g_say.reset = false; g_say.notBefore = 0;
+            g_say.text.clear(); g_say.state = g_say.refuse = g_say.reset = false; g_say.notBefore = 0;
             ReleaseSRWLockExclusive(&g_sayLock);
             if (s.quit) { g_jaws.Shutdown(); if (SUCCEEDED(hrCo)) CoUninitialize(); return 0; }
             if (s.reset) g_jaws.Shutdown();
-            if (s.refuse) PlaySoundW(L"SystemAsterisk", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+            if (s.refuse) {
+                // The same beep the IME itself makes when a key cannot be
+                // used. Paul 2026-09-13: 「打錯字的聲音用 IME 輸入無效的提示
+                // 音，這樣一致」. Windows has no IME-specific sound event; the
+                // IMEs use the system default beep, which is what
+                // MessageBeep(MB_OK) plays. The notification chime we used
+                // before (SystemAsterisk) is a different sound altogether.
+                MessageBeep(MB_OK);
+            }
             if (!s.text.empty()) {
                 LONGLONG a = Qpc();
                 // JAWS when it is there (it is the better voice and it is
@@ -467,7 +478,7 @@ DWORD WINAPI SpeechThread(LPVOID) {
                 // otherwise the system voice, so a machine with no screen
                 // reader still says 開啟 and 關閉 out loud.
                 bool ok = JawsRunning() && g_jaws.SayString(s.text, true);
-                if (!ok) ok = srspeech::Speak(s.text);
+                if (!ok) ok = srspeech::Speak(s.text, s.state);
                 if (!ok) UiaLog("點字鍵盤輸入: 送話失敗（JAWS、螢幕閱讀軟體、系統語音都沒有）");
                 else if (g_timing) UiaLog("點字鍵盤輸入: 計時 語音 %ld µs 「%s」", Us(a, Qpc()), Utf8(s.text).c_str());
             }
@@ -485,6 +496,8 @@ DWORD WINAPI SpeechThread(LPVOID) {
 HHOOK    g_hook = nullptr;
 unsigned g_pressed = 0;   // dot bits currently held
 unsigned g_accum   = 0;   // dot bits seen since the chord began
+unsigned g_spent   = 0;   // dot bits still held from a cell already sent: ignored until released
+inline void ChordReset() { g_pressed = g_accum = g_spent = 0; }
 bool     g_spaceHeld = false;   // the space bar is physically down (hook thread only)
 bool     g_spaceChord = false;  // space and dot keys were held together: a command chord, not text
 unsigned g_swallowUp = 0; // Space (1) / Enter (2) whose key-down was taken: take the key-up too
@@ -496,6 +509,7 @@ const unsigned kSpaceCommit = 0x1000;   // Space taken while the engine holds so
 const unsigned kEnterCommit = 0x1001;   // Enter taken while the engine holds something
 const unsigned kSpacePassed = 0x1002;   // Space went through to the application
 const unsigned kEnterPassed = 0x1003;   // Enter went through to the application
+const unsigned kSpaceTyped     = 0x1005;   // a space that turned out not to be the start of a chord
 const unsigned kBackspaceChord = 0x1004; // Space held together with dots: delete the last character
 
 // How long after JAWS has gone this edition waits before taking the dot
@@ -525,17 +539,56 @@ inline void PostCell(unsigned what) { PostThreadMessageW(g_mainThread.load(), WM
 
 // A command chord is complete when both the space bar and every dot key have
 // come up. Two backspace chords:
-//   Space + dots 2-4-5 (the braille letter j) - the backspace chord Taiwanese
-//   braille users already know from 淡江大學's 視窗導盲鼠 screen reader
-//   (Paul 2026-09-13: every edition must have it).
-//   Space + dots 2-5 (the two middle keys) - the reach a blind writer already
-//   has for "take that back".
+//   Space + dots 2-4-5, the braille letter j: the backspace chord Taiwanese
+//   braille users already know from 淡江大學's 視窗導盲鼠 screen reader.
+//   Paul 2026-09-13: every edition has it, and only it.
 // Space held with dots is never ordinary typing (marks are confirmed by a
 // separate Space press, not one held down with the cell), so claiming these
 // costs nothing.
 inline void EvaluateSpaceChord() {
-    if (g_accum == (kDot2 | kDot4 | kDot5) || g_accum == (kDot2 | kDot5)) PostCell(kBackspaceChord);
+    if (g_accum == (kDot2 | kDot4 | kDot5)) PostCell(kBackspaceChord);
     g_spaceChord = false; g_accum = 0;
+}
+
+// ---- when a cell is sent ----
+// Until 2026-09-13 a cell went out when the first dot key came up. That is
+// already far quicker than waiting for the whole chord to lift, but the
+// finger still has to travel, and Paul can feel it: 「還有點黏手」.
+//
+// So the cell now goes out while the fingers are still down: a settling
+// thread waits for a short quiet spell after the last dot key went DOWN and
+// sends then. A chord's keys land within a few milliseconds of each other,
+// so the quiet spell only ends once the chord is complete; the keys still
+// held are marked spent and their release does nothing. Put a file
+// braille_hold_mode.txt beside the log to go back to sending on release.
+// 2026-09-13: 22 ms split two-finger cells - a digit typed as dots 2-3 came
+// out as 「1」 then 「引號」, because the second finger landed 30 ms after the
+// first. Human fingers in one chord are up to ~50 ms apart. The cell is also
+// sent the moment the first key is released, which is usually sooner than
+// this, so the feel does not change for a fast writer; this is only the
+// backstop for a chord whose fingers land unevenly.
+const DWORD kSettleMsDefault = 60;
+DWORD  g_settleMs = kSettleMsDefault;
+bool   g_pressMode = true;           // send while held, rather than on release
+HANDLE g_settleEvent = nullptr;      // auto-reset: a dot key went down
+
+DWORD WINAPI SettleThread(LPVOID) {
+    for (;;) {
+        WaitForSingleObject(g_settleEvent, INFINITE);
+        // Keep extending while keys keep arriving: the chord is still landing.
+        while (WaitForSingleObject(g_settleEvent, g_settleMs) == WAIT_OBJECT_0) {}
+        unsigned dots = g_accum;
+        if (!dots) continue;
+        if (g_spaceChord) continue;             // space + dots is a command, decided when everything lifts
+        // A modifier went down while the chord was settling: the user is
+        // pressing a shortcut (Win+D, Alt+F4, Ctrl+S), not writing braille.
+        // 2026-09-13: without this, the dots that had already landed were
+        // sent as a cell and the shortcut lost its letter.
+        if (ModifierHeld()) { g_pressed = g_accum = 0; continue; }
+        g_spent |= g_pressed & dots;            // whatever is still down belongs to the cell just sent
+        g_accum = 0;
+        PostCell(dots);
+    }
 }
 
 // What a dot key going down or up does to the chord. Two editions:
@@ -546,12 +599,12 @@ inline void EvaluateSpaceChord() {
 #ifdef BRL_DRIVER
 #include "brl_driver.inc"
 #else
-inline void ChordReset() { g_pressed = g_accum = 0; }
 inline void DotKeyEvent(unsigned dot, bool down) {
     if (down) {
         g_pressed |= dot;             // repeats just set the bit again
         g_accum   |= dot;
         if (g_spaceHeld) g_spaceChord = true;   // space + dots held together = a command chord
+        if (g_pressMode && g_settleEvent && !g_spaceHeld) SetEvent(g_settleEvent);
     } else {
         g_pressed &= ~dot;
         if (g_spaceChord) {
@@ -584,15 +637,52 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     const DWORD vk = k->vkCode;
     const bool isShift = vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT;
     if (down) g_shiftBare = isShift;
+
+    // ---- Ctrl+F12, taken here rather than by RegisterHotKey ----
+    // 2026-09-13, Paul: pressing it four times a second made JAWS read out
+    // 「Control F 12」 over and over. A registered hot key is consumed by the
+    // system, but JAWS's own keyboard hook still sees the keystroke and
+    // announces it. Swallowed here, the key stops at this program.
+    //
+    // This is why the hook is now always installed. It changes nothing else:
+    // outside an editable field, and whenever the mode is off, every key
+    // goes straight through untouched - the dot keys are only ever taken in
+    // an edit box, exactly as before.
+    if (vk == VK_F12 && !(GetAsyncKeyState(VK_MENU) & 0x8000) && !(GetAsyncKeyState(VK_SHIFT) & 0x8000) &&
+        !(GetAsyncKeyState(VK_LWIN) & 0x8000) && !(GetAsyncKeyState(VK_RWIN) & 0x8000) &&
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+        if (down && !(k->flags & LLKHF_INJECTED)) PostThreadMessageW(g_mainThread.load(), WM_APP_TOGGLE, 1, 0);   // wParam 1: the handler is shared with WM_HOTKEY, whose id is 1
+        return 1;
+    }
+
+    // Mode off: out before anything is asked of the system. The hook is
+    // permanent now (it has to be, to swallow Ctrl+F12), and until 2026-09-13
+    // it went on to call GetForegroundWindow, GetGUIThreadInfo and wake the
+    // focus watcher for every keystroke on the machine - so typing anywhere
+    // re-examined the focus, and in Claude that is enough to move it.
+    if (!g_enabled.load()) return CallNextHookEx(g_hook, code, wParam, lParam);
+
     HWND fg = GetForegroundWindow();
     HWND focus = fg;
     if (fg) {
         GUITHREADINFO gti = {}; gti.cbSize = sizeof(gti);
         if (GetGUIThreadInfo(GetWindowThreadProcessId(fg, nullptr), &gti) && gti.hwndFocus) focus = gti.hwndFocus;
     }
-    if (fg != g_fg.load() || focus != g_focus.load() || !g_editable.load()) {
+    // Focus moved: forget the half-typed cell and ask the watcher to look
+    // again. Only here - a keystroke outside an edit box must not make this
+    // program do anything at all, or every key anywhere on the machine wakes
+    // a thread that re-examines the focus (2026-09-13: that is what moved
+    // Claude's cursor while typing).
+    if (fg != g_fg.load() || focus != g_focus.load()) {
         ChordReset();
         if (g_recheck) SetEvent(g_recheck);
+        return CallNextHookEx(g_hook, code, wParam, lParam);
+    }
+    // Known to be outside an editable field: every key goes straight through,
+    // so JAWS and every other screen reader still announce it and every
+    // shortcut still works. Only the braille chords are not read here.
+    if (!g_editable.load()) {
+        ChordReset();
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
@@ -621,7 +711,13 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             // chord (e.g. backspace), not a space: swallow it and decide when
             // everything comes up.
             if (vk == VK_SPACE && g_pressed != 0) { g_spaceHeld = true; g_spaceChord = true; g_swallowUp |= bit; return 1; }
-            if (vk == VK_SPACE) g_spaceHeld = true;
+            // Space on its own is held back until it comes up. Until
+            // 2026-09-13 it went straight to the application, so a backspace
+            // typed as Space-then-J put a space in the document first and
+            // then deleted it - the user pressed backspace and nothing of
+            // theirs went away. Whether a space is a space or the start of a
+            // chord is only knowable at the end, so the decision waits.
+            if (vk == VK_SPACE) { g_spaceHeld = true; g_swallowUp |= bit; return 1; }
             if (g_waiting.load()) {
                 g_swallowUp |= bit;
                 PostCell(vk == VK_SPACE ? kSpaceCommit : kEnterCommit);
@@ -637,6 +733,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             if (g_spaceChord) {                 // the chord ends when space and all dots are up
                 if (g_pressed == 0) EvaluateSpaceChord();
                 g_swallowUp &= ~bit;
+                return 1;
+            }
+            if (g_swallowUp & bit) {            // it was a space after all
+                g_swallowUp &= ~bit;
+                PostCell(g_waiting.load() ? kSpaceCommit : kSpaceTyped);
                 return 1;
             }
         }
@@ -1012,23 +1113,26 @@ BrlEngine g_engine;
 // JAWS is up. When it is running, this stand-alone edition stands down: no
 // hook, no Ctrl+F12, no speech - and takes over again the moment it is gone.
 std::atomic<bool> g_standDown{false};
+// Is the JAWS edition of this program running? Asked several times a second,
+// so it asks the cheapest question there is: that copy holds a named mutex
+// for as long as it lives, and opening a mutex is a handle lookup - no
+// process snapshot, no enumeration. 2026-09-13: the two editions must never
+// both hold a keyboard hook, and a one-second poll left a window where they
+// did; that window is what two programs fighting over the keyboard felt like.
 bool JawsEditionRunning() {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-    PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
-    bool found = false;
-    if (Process32FirstW(snap, &pe)) {
-        do { if (_wcsicmp(pe.szExeFile, L"\u9ede\u5b57\u9375\u76e4\u8f38\u5165.exe") == 0) { found = true; break; } } while (Process32NextW(snap, &pe));
-    }
-    CloseHandle(snap);
-    return found;
+    HANDLE h = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\JAWS-CHT-BrailleKey");
+    if (!h) return false;
+    CloseHandle(h);
+    return true;
 }
 
 void ApplyHookWish() {
-    bool want = g_enabled.load() && g_editable.load() && !g_standDown.load();
+    bool want = !g_standDown.load();   // on unless the JAWS edition has taken over; Ctrl+F12 is swallowed by
+                                     // the hook, so it must be gone the moment this edition stands down
+    const bool taking = g_enabled.load() && g_editable.load() && !g_standDown.load() && !g_standDown.load();
     DWORD t = g_hookThread.load();
     if (t) PostThreadMessageW(t, WM_APP_HOOK, want ? 1 : 0, 0);
-    if (!want) g_engine.Reset();
+    if (!taking) g_engine.Reset();
     else RequestMode("焦點決定", 0, true);
 }
 
@@ -1039,7 +1143,7 @@ void SetEnabled(bool on, bool announce) {
     if (g_recheck) SetEvent(g_recheck);
     ApplyHookWish();
     UiaLog("點字鍵盤輸入: %s", on ? "開啟" : "關閉");
-    if (announce) Say(on ? L"點字鍵盤輸入 開啟" : L"點字鍵盤輸入 關閉");
+    if (announce) Say(on ? L"點字輸入 開啟" : L"點字輸入 關閉", 0, true);   // at once; a burst collapses on its own because an unspoken line is replaced
 }
 
 const char* ActionName(BrlOutput::Action a) {
@@ -1097,10 +1201,36 @@ void OnCell(unsigned dots, LONGLONG tPosted) {
         Act(f, "Enter 前先打出等待中的方", VK_RETURN);
         return;
     }
+    if (dots == kSpaceTyped) {
+        // The space was held back to see whether dots joined it. They did
+        // not, so it is typed now - one space, in the right order, after
+        // anything the engine was holding.
+        BrlOutput o = g_engine.Flush();
+        g_waiting.store(false);
+        if (!o.text.empty()) Act(o, "空白前先送出等待中的方");
+        Injector inj;
+        inj.Key(VK_SPACE);
+        return;
+    }
     if (dots == kSpacePassed) { g_engine.Flush(); g_waiting.store(false); return; }    // a space ends a number
     if (dots == kEnterPassed) { g_engine.PlainKey(); g_waiting.store(false); return; }
+    // Dot 7 alone (the A key) and dot 8 alone (semicolon) are a braille
+    // display's Backspace and Enter, not a keyboard's. Paul 2026-09-13:
+    // 「這個設計不能用，鍵盤要用空白加二四五點」 - on a computer keyboard a
+    // finger landing on one of them while reaching for another would delete
+    // the user's work. The keyboard's backspace is Space held with dots
+    // 2-4-5 (or 2-5); these two do nothing until a display is driving.
+    if (dots == kDot7 || dots == kDot8) {
+        // Dot 7 is a real part of Nemeth cells (4-5-7 is the caret, 「次方」),
+        // so the key itself is not wrong - only pressing it alone is. Say
+        // which dot it was and do nothing else.
+        Say(dots == kDot7 ? L"七" : L"八", 0, false);
+        if (g_timing) UiaLog("點字鍵盤輸入: 點%s 單獨按，鍵盤上只唸點位", dots == kDot7 ? "7" : "8");
+        return;
+    }
+
     if (dots == kBackspaceChord) {
-        // Space + dots 2-4-5 (or 2-5): drop anything half-composed and send one
+        // Space + dots 2-4-5: drop anything half-composed and send one
         // Backspace to the application, so a wrong character just typed is gone.
         g_engine.Reset(); g_waiting.store(false);
         BrlOutput o; o.action = BrlOutput::Backspace; o.spoken = L"退格";
@@ -1236,6 +1366,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     UiaLog("點字鍵盤輸入: 中文表：音節 %d 筆（Phn.tbl）、標點符號 %d 條（國語點字，來源 BrlIMEHelper 資料表）", BrlSyllableTableSize(), BrlChineseSymbolCount());
     UiaLog("點字鍵盤輸入: Nemeth 表：%d 條（JAWS Liblouis nemeth 表加 BKey Sign.tbl）", BrlNemethSymbolCount());
 
+    if (const char* diag = DiagDir()) {
+        char flag[MAX_PATH];
+        snprintf(flag, sizeof(flag), "%s\\braille_hold_mode.txt", diag);
+        if (GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) g_pressMode = false;
+    }
+    g_settleEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE settleThread = g_pressMode ? CreateThread(nullptr, 0, SettleThread, nullptr, 0, nullptr) : nullptr;
+    if (settleThread) { SetThreadPriority(settleThread, THREAD_PRIORITY_HIGHEST); CloseHandle(settleThread); }
+    UiaLog("點字鍵盤輸入: 送方時機 %s", g_pressMode ? "按住時就送（安定 22 毫秒）" : "第一顆鍵放開才送");
     HANDLE speechThread = CreateThread(nullptr, 0, SpeechThread, nullptr, 0, nullptr);
     HANDLE modeThread   = CreateThread(nullptr, 0, ModeThread, nullptr, 0, nullptr);
     HANDLE hookThread   = CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr);
@@ -1251,13 +1390,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             UiaLog("點字鍵盤輸入: Ctrl+F12 註冊失敗 (%lu)", GetLastError());
         // On at the last shutdown means on now, and the dot keys are being
         // taken again: say so once. Off says nothing at all.
-        if (g_enabled.load()) Say(L"點字鍵盤輸入已開啟", 1500);
+        if (g_enabled.load()) Say(L"點字輸入已開啟", 1500, true);
     }
 
     // Announce on every JAWS start while the mode is on; never when it is off.
     bool jawsWasUp = false;
-    DWORD jawsGoneAt = 0;   // tick when JAWS was last seen to be gone; 0 = it is here
-    SetTimer(nullptr, 1, 1000, nullptr);
+    // Tick when JAWS was last seen to be gone; 0 means it is here right now.
+    // Started in the past by the whole delay: JAWS that was never running is
+    // not "just closed", so the first tick must not stand this edition down.
+    DWORD jawsGoneAt = GetTickCount() - kResumeAfterJawsMs;
+    if (!jawsGoneAt) jawsGoneAt = 1;
+    SetTimer(nullptr, 1, 250, nullptr);   // the hand-over has to be quick; the costly check below still runs once a second
 
     // The JAWS edition lives and dies with JAWS: the shell (cht-shell) sets
     // this event when JAWS has been gone for a few seconds, and this
@@ -1274,6 +1417,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         while (running && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) { running = false; break; }
         switch (msg.message) {
+        case WM_APP_TOGGLE:
         case WM_HOTKEY:
             if (msg.wParam == 1 && !g_standDown.load()) SetEnabled(!g_enabled.load(), true);
             break;
@@ -1294,8 +1438,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             // serving. Three seconds after JAWS has gone, this one comes
             // back (Paul 2026-09-13: 「JAWS 關閉後三秒才重新回來」); the delay
             // keeps a JAWS restart from handing the keyboard back and forth.
-            bool up = JawsRunning();
-            bool busy = up || JawsEditionRunning();
+            // The mutex question is cheap enough for every tick; looking for
+            // jfw.exe means a process snapshot, so that one is asked once a
+            // second. Either answer alone is enough to stand down.
+            static DWORD lastJawsLook = 0;
+            static bool  jawsSeen = false;
+            DWORD tick = GetTickCount();
+            if (!lastJawsLook || tick - lastJawsLook >= 1000) { lastJawsLook = tick ? tick : 1; jawsSeen = JawsRunning(); }
+            bool editionUp = JawsEditionRunning();
+            if (editionUp) jawsSeen = true;            // it only runs while JAWS does
+            bool up = jawsSeen;
+            bool busy = up || editionUp;
             DWORD now = GetTickCount();
             if (busy) jawsGoneAt = 0;
             else if (!jawsGoneAt) jawsGoneAt = now ? now : 1;
@@ -1316,7 +1469,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
                     srspeech::Enable();
                     if (!RegisterHotKey(nullptr, 1, MOD_CONTROL | MOD_NOREPEAT, VK_F12)) UiaLog("點字鍵盤輸入: Ctrl+F12 註冊失敗 (%lu)", GetLastError());
                     UiaLog("點字鍵盤輸入(獨立版): JAWS 已結束 %lu 秒，恢復（狀態 %s）", kResumeAfterJawsMs / 1000, g_enabled.load() ? "開啟" : "關閉");
-                    if (g_enabled.load()) Say(L"點字鍵盤輸入已開啟", 500);   // it is live again and eating the dot keys: say so
+                    // Paul 2026-09-13: say which one is serving now, so the
+                    // hand-over is never silent guesswork.
+                    if (g_enabled.load()) Say(L"點字輸入已開啟", 500, true);
                 }
                 ApplyHookWish();
             }

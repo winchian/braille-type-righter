@@ -136,8 +136,11 @@ int wmain(int argc, wchar_t** argv) {
     Case(L"問號 1456 then space bar (ㄧㄣ before a blank)", BrlMode::Chinese, "1456 SP", L"？", L"問號|");
     Case(L"問號 with ㄋ 1345", BrlMode::Chinese, "1345 3", L"？");
     Case(L"驚嘆號 with ㄎ 123", BrlMode::Chinese, "123 3", L"！");
-    Case(L"因 ㄧㄣ first tone is dot 3, not the space bar", BrlMode::Chinese, "1456 3", L"up ", L"衣 恩 一聲|");
-    Case(L"我 with a held rime speaks once", BrlMode::Chinese, "25 4", L"ji3", L"烏 喔 三聲|");
+    // 2026-09-13: a tone says nothing of its own any more. It finishes the
+    // syllable, the IME composes the character, and the screen reader
+    // announces that - which is what the user actually wants to hear.
+    Case(L"因 ㄧㄣ first tone is dot 3, not the space bar", BrlMode::Chinese, "1456 3", L"up ", L"");
+    Case(L"我 with a held rime speaks once", BrlMode::Chinese, "25 4", L"ji3", L"");
     Case(L"held rime then a new syllable", BrlMode::Chinese, "25 124 345 3", L"jiw8 ");
     Case(L"held rime then the space bar", BrlMode::Chinese, "25 SP", L"ji ");
     Case(L"刪節號", BrlMode::Chinese, "5 5 5", L"…", L"刪節號|");
@@ -158,7 +161,7 @@ int wmain(int argc, wchar_t** argv) {
     Case(L"± ∞", BrlMode::Chinese, "346 36 6 123456", L"±∞");
     Case(L"右箭頭", BrlMode::Chinese, "1246 25 25 135", L"→", L"右箭頭|");
     Case(L"左箭頭", BrlMode::Chinese, "1246 246 25 25", L"←");
-    Case(L"∠ then a syllable (co-existing longer symbol)", BrlMode::Chinese, "1246 246 124 345 3", L"∠w8 ", L"角|特 啊|一聲|");
+    Case(L"∠ then a syllable (co-existing longer symbol)", BrlMode::Chinese, "1246 246 124 345 3", L"∠w8 ", L"角|特 啊|");
     Case(L"∠ then the space bar", BrlMode::Chinese, "1246 246 SP", L"∠ ");
     Case(L"wrong cell inside a symbol is refused, sequence kept", BrlMode::Chinese, "1246 126 1 25 25 135", L"<ERR>↑");
     Case(L"dot 7 takes a held cell back", BrlMode::Chinese, "1246 126 7 25 25 135", L"→", L"退格|右箭頭|");
@@ -166,7 +169,7 @@ int wmain(int argc, wchar_t** argv) {
     Case(L"α wins over ㄧㄤ neutral tone", BrlMode::Chinese, "46 1", L"α", L"阿爾法|");
     Case(L"央 ㄧㄤ first tone", BrlMode::Chinese, "46 3", L"u; ");
     Case(L"娘 ㄋㄧㄤ neutral tone", BrlMode::Chinese, "1345 46 1", L"su;7");
-    Case(L"唷 ㄧㄛ 356 first tone", BrlMode::Chinese, "356 3", L"ui ", L"衣 喔 一聲|");
+    Case(L"唷 ㄧㄛ 356 first tone", BrlMode::Chinese, "356 3", L"ui ", L"");
     Case(L"欸 ㄟ 356 fourth tone", BrlMode::Chinese, "356 5", L"o4");
     Case(L"崖 ㄧㄞ 26 second tone", BrlMode::Chinese, "26 2", L"u96");
     Case(L"誒 ㄝ 26 fourth tone", BrlMode::Chinese, "26 5", L",4");

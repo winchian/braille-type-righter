@@ -274,7 +274,7 @@
 { "456-46-1246", L"▼", L"實心倒三角形" },  // nemethdefs.cti U+25BC
 { "456-56", L"", L"粗體" },  // Nemeth indicator 
 { "456-123", L"≡", L"恆等於" },  // nemethdefs.cti U+2261
-{ "456-126", L"^", L"插入號" },  // nemethdefs.cti U+005E
+{ "456-126", L"^", L"次方" },  // nemethdefs.cti U+005E
 { "456-146", L"", L"Nemeth 開始" },  // Nemeth indicator 
 { "456-156", L"", L"Nemeth 結束" },  // Nemeth indicator 
 { "456-236", L"?", L"問號" },  // nemeth.ctb U+003F
@@ -288,7 +288,7 @@
 { "456-12346", L"&", L"和" },  // nemeth.ctb U+0026
 { "456-12456", L"†", L"劍號" },  // nemethdefs.cti U+2020
 { "456-123456", L"∝", L"正比" },  // nemethdefs.cti U+221D
-{ "457", L"^", L"插入號" },  // en-chardefs.cti U+005E
+{ "457", L"^", L"次方" },  // en-chardefs.cti U+005E
 { "1246", L"$", L"錢號" },  // en-chardefs.cti U+0024
 { "1246-1", L"⌢", L"弧" },  // nemethdefs.cti U+2322
 { "1246-3", L"⌣", L"凹弧" },  // nemethdefs.cti U+2323

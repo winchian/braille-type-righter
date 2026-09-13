@@ -13,3 +13,11 @@
 執行時若機器上裝有 JAWS，程式會改讀 JAWS 安裝目錄裡的 `US_Unicode.jbt`；沒有 JAWS 就用內建的 `us_unicode.inc`。
 
 「JAWS」為 Vispero 的商標。本專案為獨立作品，與 Vispero 或 Freedom Scientific 無關；JAWS 版（隨 JAWS 起落、整合更深、更快）另行隨 JAWS 中文延伸套件發行，不在本儲存庫。
+
+## NVDA Controller Client
+
+`vendor/nvda/nvdaControllerClient64.dll` is NV Access's controller client,
+版本 2026.2，授權 GNU LGPL 2.1（全文在同一個資料夾的 `license.txt`）。本程式
+**以檔名在執行期動態載入它，沒有連結、沒有修改**，把它刪掉程式照樣執行，只是
+NVDA 底下不會出聲。要換成別的版本，直接覆蓋同名檔案即可。
+來源：https://www.nvaccess.org/files/nvda/releases/2026.2/nvda_2026.2_controllerClient.zip

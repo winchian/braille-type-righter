@@ -483,7 +483,14 @@ BrlOutput BrlEngine::SyllableKeys(unsigned rime, unsigned tone) {
     else keys = LookupSyllable(std::string(1, CellToAscii(rime)));
     if (!keys) { out.action = BrlOutput::Error; return out; }
     out.action = BrlOutput::Keys; out.text = Widen(keys); out.spoken = SpokenForKeys(keys);
-    if (const Tone* t = ToneFor(tone)) { out.text += t->key; out.spoken += L" " + std::wstring(t->name); awaitingTone_ = false; }
+    // The tone finishes the syllable, and what the user wants to hear then is
+    // the character the IME produced - 「打出ㄅ按一聲就要直接念般，不要再讀一
+    // 聲」 (Paul 2026-09-13). So nothing is said from here: the keys go to the
+    // IME and whichever screen reader is present announces what came out.
+    // This is why it is done in the engine and not by asking IMEHelper - the
+    // edition that ships on its own has no IMEHelper, and an input method
+    // that reads the tone instead of the word is no use to anybody.
+    if (const Tone* t = ToneFor(tone)) { out.text += t->key; out.spoken.clear(); awaitingTone_ = false; }
     else awaitingTone_ = tone == 0;
     return out;
 }
@@ -500,7 +507,14 @@ BrlOutput BrlEngine::ChineseFlush() {
     if (held.size() == 1) {
         unsigned h = held[0];
         char c = CellToAscii(h);
-        if (IsInitial(c)) return out;
+        // A bare initial with no rime and no tone used to be dropped here.
+        // Paul 2026-09-13: 「允許獨立注音出現，不然他要打火星文如ㄉㄅ會死人」
+        // - so it is sent to the IME as it stands. The IME keeps it in its
+        // composition, another bare symbol can follow it, and Enter commits
+        // whatever is there. Nothing is guessed and no tone is invented,
+        // which is also why the space bar no longer becomes a first tone:
+        // in braille the space confirms a mark.
+        if (IsInitial(c)) { out = SyllableKeys(h, 0); awaitingTone_ = false; return out; }
         if (ToneRimeFor(h) || LookupSyllable(std::string(1, c))) { out = SyllableKeys(h, 0); awaitingTone_ = false; return out; }
         std::vector<unsigned> withBlank = { h, 0 };
         if (TwExact(withBlank)) return out;      // a mark left unconfirmed at Enter: dropped, as the IME drops its composition
@@ -519,7 +533,7 @@ BrlOutput BrlEngine::Chinese(unsigned dots, bool blank) {
     // A finished syllable is waiting for its tone.
     if (awaitingTone_) {
         awaitingTone_ = false;
-        if (const Tone* t = ToneFor(dots)) { out.action = BrlOutput::Keys; out.text = t->key; out.spoken = t->name; return out; }
+        if (const Tone* t = ToneFor(dots)) { out.action = BrlOutput::Keys; out.text = t->key; out.spoken.clear(); return out; }   // see above: the character speaks for itself
         // No tone written: the user went straight on to the next syllable.
         // Fall through and treat this cell as a new start.
     }

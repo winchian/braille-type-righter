@@ -7,8 +7,27 @@
 //
 // Two paths, chosen per utterance, no configuration:
 //
-//   A screen reader is running (SPI_GETSCREENREADER)
-//       -> a UI Automation notification event. This is the operating
+//   NVDA is running
+//       -> its own controller client (nvdaControllerClient64.dll, shipped
+//          beside this program, loaded by name, never linked against). This
+//          is what NVDA documents for programs that are not the foreground
+//          application, and a background helper is exactly that: a UI
+//          Automation notification raised from a window nobody is looking at
+//          is not guaranteed to be announced.
+//
+//   Another screen reader is running (SPI_GETSCREENREADER) - Narrator, or
+//   anything else
+//       -> Microsoft's dynamic annotation on the window that has the
+//          keyboard focus: give it the message as its accessible name and
+//          raise EVENT_OBJECT_NAMECHANGE on it, then put the name back a
+//          moment later without raising anything. Measured 2026-09-13 with a
+//          listener written like a screen reader's: a UI Automation
+//          notification from a background program IS delivered, but screen
+//          readers drop events whose window is not the foreground one, which
+//          a hidden helper window never is. The focused window is, which is
+//          why this is the path that works from outside the application.
+//          Only the mode messages go this way - renaming somebody's edit box
+//          for every braille cell would be intolerable. This is the operating
 //          system's own way for a program to hand a screen reader something
 //          to say; NVDA and Narrator speak it. We raise it from a hidden
 //          1x1 window of our own, so nothing about any other program's
@@ -32,11 +51,57 @@
 #pragma once
 #include <windows.h>
 #include <uiautomation.h>
+#include <oleacc.h>
 #include <oleauto.h>
 #include <atomic>
 #include <string>
 
 namespace srspeech {
+
+// ---- NVDA ----
+// nvdaControllerClient64.dll beside the executable. LGPL 2.1 (its licence
+// travels with it in vendor\nvda); loaded by name at run time and never
+// linked against, so it can be replaced or removed without this program.
+typedef unsigned long (__stdcall *PfnNvdaTestIfRunning)(void);
+typedef unsigned long (__stdcall *PfnNvdaSpeakText)(const wchar_t*);
+typedef unsigned long (__stdcall *PfnNvdaCancelSpeech)(void);
+
+inline HMODULE NvdaClient() {
+    static HMODULE m = [] {
+        wchar_t own[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameW(nullptr, own, MAX_PATH);
+        if (!n || n >= MAX_PATH) return (HMODULE)nullptr;
+        wchar_t* slash = wcsrchr(own, L'\\');
+        if (slash) *(slash + 1) = 0;
+        std::wstring path = std::wstring(own) + L"nvdaControllerClient64.dll";
+        HMODULE h = LoadLibraryW(path.c_str());
+        if (!h) h = LoadLibraryW(L"nvdaControllerClient64.dll");   // beside it, or wherever the system finds one
+        return h;
+    }();
+    return m;
+}
+template <typename T> inline T NvdaProc(const char* name) {
+    HMODULE m = NvdaClient();
+    return m ? (T)(void*)GetProcAddress(m, name) : nullptr;
+}
+// NVDA answers 0 when it is running; every other value (including the RPC
+// error when it is not there) means no.
+inline bool NvdaRunning() {
+    static PfnNvdaTestIfRunning f = NvdaProc<PfnNvdaTestIfRunning>("nvdaController_testIfRunning");
+    return f && f() == 0;
+}
+inline bool SpeakViaNvda(const std::wstring& text, bool state) {
+    if (!NvdaRunning()) return false;
+    static PfnNvdaCancelSpeech cancel = NvdaProc<PfnNvdaCancelSpeech>("nvdaController_cancelSpeech");
+    static PfnNvdaSpeakText speak = NvdaProc<PfnNvdaSpeakText>("nvdaController_speakText");
+    if (!speak) return false;
+    // Everything replaces itself. The previous cell's name is stale the
+    // moment the next one lands, and so is 「開啟」 the moment the user has
+    // pressed again: what must never happen is the answer to a keypress
+    // waiting in a queue behind a sentence nobody is listening to any more.
+    if (cancel) cancel();
+    return speak(text.c_str()) == 0;
+}
 
 // ---- the bits of UIAutomationCore we use, loaded by name ----
 // Declared here rather than taken from the SDK headers so that the program
@@ -172,6 +237,58 @@ inline bool SpeakViaUia(const std::wstring& text) {
     return SUCCEEDED(hr);
 }
 
+// ---- the focused window, annotated ----
+// IAccPropServices is Microsoft's documented way for one program to add
+// accessibility information to another program's control. The annotation is
+// removed again after the screen reader has had time to read it, and the
+// removal raises no event, so nothing is said twice.
+inline IAccPropServices* PropServices() {
+    static IAccPropServices* p = [] {
+        IAccPropServices* q = nullptr;
+        // mingw's oleacc.h has no uuid attribute on IAccPropServices, so the
+        // interface id is spelled out (6E26E776-04F0-495D-80E4-3330352E3169).
+        const IID iidProps = { 0x6E26E776, 0x04F0, 0x495D, { 0x80, 0xE4, 0x33, 0x30, 0x35, 0x2E, 0x31, 0x69 } };
+        if (FAILED(CoCreateInstance(CLSID_AccPropServices, nullptr, CLSCTX_INPROC_SERVER, iidProps, (void**)&q))) q = nullptr;
+        return q;
+    }();
+    return p;
+}
+
+inline HWND FocusedWindow() {
+    GUITHREADINFO gti = {}; gti.cbSize = sizeof(gti);
+    HWND fg = GetForegroundWindow();
+    DWORD tid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    if (tid && GetGUIThreadInfo(tid, &gti) && gti.hwndFocus) return gti.hwndFocus;
+    return fg;
+}
+
+struct ClearJob { HWND hwnd; };
+inline DWORD WINAPI ClearAnnotationLater(LPVOID param) {
+    ClearJob* job = (ClearJob*)param;
+    Sleep(1800);
+    IAccPropServices* svc = PropServices();
+    if (svc && IsWindow(job->hwnd)) {
+        MSAAPROPID prop = PROPID_ACC_NAME;
+        svc->ClearHwndProps(job->hwnd, OBJID_CLIENT, CHILDID_SELF, &prop, 1);
+    }
+    delete job;
+    return 0;
+}
+
+inline bool SpeakViaFocusedWindow(const std::wstring& text) {
+    IAccPropServices* svc = PropServices();
+    HWND h = FocusedWindow();
+    if (!svc || !h) return false;
+    if (FAILED(svc->SetHwndPropStr(h, OBJID_CLIENT, CHILDID_SELF, PROPID_ACC_NAME, text.c_str()))) return false;
+    NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, h, OBJID_CLIENT, CHILDID_SELF);
+    ClearJob* job = new (std::nothrow) ClearJob{h};
+    if (job) {
+        HANDLE t = CreateThread(nullptr, 0, ClearAnnotationLater, job, 0, nullptr);
+        if (t) CloseHandle(t); else delete job;
+    }
+    return true;
+}
+
 // ---- the system voice ----
 // SAPI 5 through its automation interface (ProgID SAPI.SpVoice), so no
 // speech SDK header is needed. Speech-thread only: the object is kept for
@@ -239,10 +356,23 @@ inline bool SpeakViaSystemVoice(const std::wstring& text) {
     return ok;
 }
 
-// Speech-thread only.
-inline bool Speak(const std::wstring& text) {
+// Speech-thread only. `state` marks the messages that are about the mode
+// itself (opened, closed, taken over). Paul 2026-09-13: 「若沒有啟動螢幕閱讀
+// 軟體含朗讀程式就不用念，只有開關會有提示」- with no screen reader on the
+// machine the system voice says those and nothing else; the cell-by-cell
+// feedback stays quiet rather than talking over a sighted user's work.
+inline bool Speak(const std::wstring& text, bool state) {
     if (text.empty()) return true;
-    if (ScreenReaderPresent() && SpeakViaUia(text)) return true;
+    if (SpeakViaNvda(text, state)) return true;
+    if (ScreenReaderPresent()) {
+        // Narrator and anything else: only the mode messages, through the
+        // focused window, because that is the only sender they accept from a
+        // program that is not in the foreground.
+        if (!state) return true;
+        if (SpeakViaFocusedWindow(text)) return true;
+        return SpeakViaUia(text);
+    }
+    if (!state) return true;                       // nobody listening: typing stays silent
     return SpeakViaSystemVoice(text);
 }
 

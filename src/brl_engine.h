@@ -135,6 +135,7 @@ public:
     bool InNemeth() const { return nemeth_; }
 
 private:
+
     BrlOutput Chinese(unsigned dots, bool blank);   // blank: the space bar (dots ignored)
     BrlOutput ChineseFlush();
     BrlOutput SyllableKeys(unsigned rime, unsigned tone);   // a rime alone, tone 0 = none yet
