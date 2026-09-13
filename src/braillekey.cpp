@@ -64,6 +64,7 @@
 //   mode     asks the focused window's IME for its mode (WM_IME_CONTROL).
 //   speech   owns the JAWS COM object; speaks the mailbox's newest text.
 #include <windows.h>
+#include <tlhelp32.h>
 #include <imm.h>
 #include <oleacc.h>
 #include <uiautomation.h>
@@ -76,6 +77,7 @@
 #include <vector>
 
 #include "jaws_com.h"
+#include "jaws_presence.h"
 #include "shimlog_local.h"
 #include "brl_engine.h"
 
@@ -411,7 +413,7 @@ SpeechSlot g_say;               // guarded by g_sayLock
 HANDLE     g_sayEvent = nullptr;   // auto-reset
 JawsCom    g_jaws;              // speech thread only
 
-bool JawsRunning() { return FindWindowW(L"JFWUI2", nullptr) != nullptr; }
+bool JawsRunning() { return JawsProcessRunning(); }   // by process, not window: see jaws_presence.h
 
 void Say(const wchar_t* s, unsigned delayMs = 0) {
     AcquireSRWLockExclusive(&g_sayLock);
@@ -476,6 +478,8 @@ DWORD WINAPI SpeechThread(LPVOID) {
 HHOOK    g_hook = nullptr;
 unsigned g_pressed = 0;   // dot bits currently held
 unsigned g_accum   = 0;   // dot bits seen since the chord began
+bool     g_spaceHeld = false;   // the space bar is physically down (hook thread only)
+bool     g_spaceChord = false;  // space and dot keys were held together: a command chord, not text
 unsigned g_swallowUp = 0; // Space (1) / Enter (2) whose key-down was taken: take the key-up too
 bool     g_shiftBare = false;   // a Shift is down and no other key has gone down since (hook thread only)
 std::atomic<LONGLONG> g_tLastOwnKeyUp{0};   // QPC when the raw input queue last delivered one of our key-ups
@@ -485,6 +489,7 @@ const unsigned kSpaceCommit = 0x1000;   // Space taken while the engine holds so
 const unsigned kEnterCommit = 0x1001;   // Enter taken while the engine holds something
 const unsigned kSpacePassed = 0x1002;   // Space went through to the application
 const unsigned kEnterPassed = 0x1003;   // Enter went through to the application
+const unsigned kBackspaceChord = 0x1004; // Space held together with dots: delete the last character
 
 unsigned DotFor(DWORD vk) {
     switch (vk) {
@@ -505,6 +510,46 @@ bool ModifierHeld() {
 }
 
 inline void PostCell(unsigned what) { PostThreadMessageW(g_mainThread.load(), WM_APP_CELL, what, (LPARAM)Qpc()); }
+
+// A command chord is complete when both the space bar and every dot key have
+// come up. Two backspace chords:
+//   Space + dots 2-4-5 (the braille letter j) - the backspace chord Taiwanese
+//   braille users already know from 淡江大學's 視窗導盲鼠 screen reader
+//   (Paul 2026-09-13: every edition must have it).
+//   Space + dots 2-5 (the two middle keys) - the reach a blind writer already
+//   has for "take that back".
+// Space held with dots is never ordinary typing (marks are confirmed by a
+// separate Space press, not one held down with the cell), so claiming these
+// costs nothing.
+inline void EvaluateSpaceChord() {
+    if (g_accum == (kDot2 | kDot4 | kDot5) || g_accum == (kDot2 | kDot5)) PostCell(kBackspaceChord);
+    g_spaceChord = false; g_accum = 0;
+}
+
+// What a dot key going down or up does to the chord. Two editions:
+//   - this file's default: the cell is sent when every dot key has come up;
+//   - BRL_DRIVER: a faster input driver kept outside this repository
+//     (src/brl_driver.inc), used in the edition distributed with hardware.
+// Both keep the same command chords (Space + dots) and the same engine.
+#ifdef BRL_DRIVER
+#include "brl_driver.inc"
+#else
+inline void ChordReset() { g_pressed = g_accum = 0; }
+inline void DotKeyEvent(unsigned dot, bool down) {
+    if (down) {
+        g_pressed |= dot;             // repeats just set the bit again
+        g_accum   |= dot;
+        if (g_spaceHeld) g_spaceChord = true;   // space + dots held together = a command chord
+    } else {
+        g_pressed &= ~dot;
+        if (g_spaceChord) {
+            if (g_pressed == 0 && !g_spaceHeld) EvaluateSpaceChord();
+        } else if (g_pressed == 0 && g_accum) {
+            PostCell(g_accum); g_accum = 0;
+        }
+    }
+}
+#endif
 
 LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code != HC_ACTION) return CallNextHookEx(g_hook, code, wParam, lParam);
@@ -534,25 +579,19 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         if (GetGUIThreadInfo(GetWindowThreadProcessId(fg, nullptr), &gti) && gti.hwndFocus) focus = gti.hwndFocus;
     }
     if (fg != g_fg.load() || focus != g_focus.load() || !g_editable.load()) {
-        g_pressed = g_accum = 0;
+        ChordReset();
         if (g_recheck) SetEvent(g_recheck);
         return CallNextHookEx(g_hook, code, wParam, lParam);
     }
 
     unsigned dot = DotFor(vk);
     if (dot) {
-        if (ModifierHeld()) { g_pressed = g_accum = 0; return CallNextHookEx(g_hook, code, wParam, lParam); }
+        if (ModifierHeld()) { ChordReset(); return CallNextHookEx(g_hook, code, wParam, lParam); }
         if (g_dryRun) {
             if (down) UiaLog("點字鍵盤輸入(試跑): 會吃掉 vk=%lu 點%u，實際放行", vk, dot);
             return CallNextHookEx(g_hook, code, wParam, lParam);
         }
-        if (down) {
-            g_pressed |= dot;             // repeats just set the bit again
-            g_accum   |= dot;
-        } else {
-            g_pressed &= ~dot;
-            if (g_pressed == 0 && g_accum) { PostCell(g_accum); g_accum = 0; }
-        }
+        DotKeyEvent(dot, down);
         return 1;   // the dot key never reaches the application or JAWS
     }
 
@@ -566,14 +605,28 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     if ((vk == VK_SPACE || vk == VK_RETURN) && !g_dryRun && !ModifierHeld()) {
         unsigned bit = vk == VK_SPACE ? 1 : 2;
         if (down) {
+            // Space with dot keys already held is the start of a command
+            // chord (e.g. backspace), not a space: swallow it and decide when
+            // everything comes up.
+            if (vk == VK_SPACE && g_pressed != 0) { g_spaceHeld = true; g_spaceChord = true; g_swallowUp |= bit; return 1; }
+            if (vk == VK_SPACE) g_spaceHeld = true;
             if (g_waiting.load()) {
                 g_swallowUp |= bit;
                 PostCell(vk == VK_SPACE ? kSpaceCommit : kEnterCommit);
                 return 1;
             }
-            g_pressed = g_accum = 0;
+            ChordReset();
             PostCell(vk == VK_SPACE ? kSpacePassed : kEnterPassed);
             return CallNextHookEx(g_hook, code, wParam, lParam);
+        }
+        // key up
+        if (vk == VK_SPACE) {
+            g_spaceHeld = false;
+            if (g_spaceChord) {                 // the chord ends when space and all dots are up
+                if (g_pressed == 0) EvaluateSpaceChord();
+                g_swallowUp &= ~bit;
+                return 1;
+            }
         }
         if (g_swallowUp & bit) { g_swallowUp &= ~bit; return 1; }
         return CallNextHookEx(g_hook, code, wParam, lParam);
@@ -589,7 +642,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     // opens / closes, Shift+Space full / half width), Ctrl coming up
     // (Ctrl+Shift or Ctrl+Space just happened).
     if (down) {
-        g_pressed = g_accum = 0;
+        ChordReset();
         PostThreadMessageW(g_mainThread.load(), WM_APP_PLAINKEY, 0, 0);
         if (vk == VK_SPACE) VerifyMode("修飾鍵加空白", 2, true);
     } else if (isShift) {
@@ -617,14 +670,14 @@ DWORD WINAPI HookThread(LPVOID) {
         if (msg.message != WM_APP_HOOK) continue;
         bool want = msg.wParam != 0;
         if (want && !g_hook) {
-            g_pressed = g_accum = 0;
+            ChordReset();
             g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandleW(nullptr), 0);
             UiaLog("點字鍵盤輸入: 鉤子%s", g_hook ? "已掛上（在編輯框內）" : "掛載失敗");
             if (g_hook) RequestMode("鉤子掛上", 0, true);
         } else if (!want && g_hook) {
             UnhookWindowsHookEx(g_hook);
             g_hook = nullptr;
-            g_pressed = g_accum = 0;
+            ChordReset();
             UiaLog("點字鍵盤輸入: 鉤子已拆除");
         }
     }
@@ -942,8 +995,25 @@ struct Injector {
 // ------------------------------------------------------------------ main
 BrlEngine g_engine;
 
+// The JAWS edition of this program (點字鍵盤輸入.exe, part of the JAWS
+// Chinese extension) lives and dies with JAWS and is the better one while
+// JAWS is up. When it is running, this stand-alone edition stands down: no
+// hook, no Ctrl+F12, no speech - and takes over again the moment it is gone.
+std::atomic<bool> g_standDown{false};
+bool JawsEditionRunning() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (Process32FirstW(snap, &pe)) {
+        do { if (_wcsicmp(pe.szExeFile, L"\u9ede\u5b57\u9375\u76e4\u8f38\u5165.exe") == 0) { found = true; break; } } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
 void ApplyHookWish() {
-    bool want = g_enabled.load() && g_editable.load();
+    bool want = g_enabled.load() && g_editable.load() && !g_standDown.load();
     DWORD t = g_hookThread.load();
     if (t) PostThreadMessageW(t, WM_APP_HOOK, want ? 1 : 0, 0);
     if (!want) g_engine.Reset();
@@ -1017,6 +1087,14 @@ void OnCell(unsigned dots, LONGLONG tPosted) {
     }
     if (dots == kSpacePassed) { g_engine.Flush(); g_waiting.store(false); return; }    // a space ends a number
     if (dots == kEnterPassed) { g_engine.PlainKey(); g_waiting.store(false); return; }
+    if (dots == kBackspaceChord) {
+        // Space + dots 2-4-5 (or 2-5): drop anything half-composed and send one
+        // Backspace to the application, so a wrong character just typed is gone.
+        g_engine.Reset(); g_waiting.store(false);
+        BrlOutput o; o.action = BrlOutput::Backspace; o.spoken = L"退格";
+        Act(o, "空白加二四五 退格");
+        return;
+    }
     // Before this cell: how long the raw input queue took to hand the
     // previous cell's keys on (the last of them came back through the hook
     // at g_tLastOwnKeyUp). Time the application and the IME then spend on
@@ -1119,7 +1197,7 @@ void LoadJawsTable() {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\JAWS-CHT-BrailleKey");
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\BrailleTypewriter");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     LARGE_INTEGER f; if (QueryPerformanceFrequency(&f) && f.QuadPart) g_qpf = f.QuadPart;
@@ -1152,7 +1230,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     HANDLE watcher      = CreateThread(nullptr, 0, FocusWatcher, nullptr, 0, nullptr);
     (void)modeThread; (void)hookThread; (void)watcher;
 
-    if (!RegisterHotKey(nullptr, 1, MOD_CONTROL | MOD_NOREPEAT, VK_F12))
+    g_standDown.store(JawsEditionRunning());
+    if (g_standDown.load()) UiaLog("點字鍵盤輸入(獨立版): JAWS 版正在跑，先讓開");
+    else if (!RegisterHotKey(nullptr, 1, MOD_CONTROL | MOD_NOREPEAT, VK_F12))
         UiaLog("點字鍵盤輸入: Ctrl+F12 註冊失敗 (%lu)", GetLastError());
 
     // Announce on every JAWS start while the mode is on; never when it is off.
@@ -1175,7 +1255,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         if (msg.message == WM_QUIT) { running = false; break; }
         switch (msg.message) {
         case WM_HOTKEY:
-            if (msg.wParam == 1) SetEnabled(!g_enabled.load(), true);
+            if (msg.wParam == 1 && !g_standDown.load()) SetEnabled(!g_enabled.load(), true);
             break;
         case WM_APP_CELL:
             OnCell((unsigned)msg.wParam, (LONGLONG)msg.lParam);
@@ -1188,6 +1268,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             ApplyHookWish();
             break;
         case WM_TIMER: {
+            bool sd = JawsEditionRunning();
+            if (sd != g_standDown.load()) {
+                g_standDown.store(sd);
+                if (sd) { UnregisterHotKey(nullptr, 1); g_engine.Reset(); UiaLog("點字鍵盤輸入(獨立版): JAWS 版接手，讓開"); }
+                else {
+                    if (!RegisterHotKey(nullptr, 1, MOD_CONTROL | MOD_NOREPEAT, VK_F12)) UiaLog("點字鍵盤輸入: Ctrl+F12 註冊失敗 (%lu)", GetLastError());
+                    UiaLog("點字鍵盤輸入(獨立版): JAWS 版已結束，恢復");
+                }
+                ApplyHookWish();
+            }
             bool up = JawsRunning();
             if (up != jawsWasUp) {
                 jawsWasUp = up;

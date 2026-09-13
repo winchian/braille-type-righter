@@ -2,3 +2,5 @@ build/
 *.exe
 *.o
 *.log
+installer/
+src/brl_driver.inc
