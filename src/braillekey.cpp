@@ -78,6 +78,7 @@
 
 #include "jaws_com.h"
 #include "jaws_presence.h"
+#include "sr_speech.h"
 #include "shimlog_local.h"
 #include "brl_engine.h"
 
@@ -458,11 +459,17 @@ DWORD WINAPI SpeechThread(LPVOID) {
             if (s.quit) { g_jaws.Shutdown(); if (SUCCEEDED(hrCo)) CoUninitialize(); return 0; }
             if (s.reset) g_jaws.Shutdown();
             if (s.refuse) PlaySoundW(L"SystemAsterisk", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
-            if (!s.text.empty() && JawsRunning()) {
+            if (!s.text.empty()) {
                 LONGLONG a = Qpc();
-                bool ok = g_jaws.SayString(s.text, true);
-                if (!ok) UiaLog("點字鍵盤輸入: 送話失敗");
-                else if (g_timing) UiaLog("點字鍵盤輸入: 計時 語音 SayString %ld µs 「%s」", Us(a, Qpc()), Utf8(s.text).c_str());
+                // JAWS when it is there (it is the better voice and it is
+                // this program's own screen reader); otherwise a UI
+                // Automation notification, which NVDA and Narrator speak;
+                // otherwise the system voice, so a machine with no screen
+                // reader still says 開啟 and 關閉 out loud.
+                bool ok = JawsRunning() && g_jaws.SayString(s.text, true);
+                if (!ok) ok = srspeech::Speak(s.text);
+                if (!ok) UiaLog("點字鍵盤輸入: 送話失敗（JAWS、螢幕閱讀軟體、系統語音都沒有）");
+                else if (g_timing) UiaLog("點字鍵盤輸入: 計時 語音 %ld µs 「%s」", Us(a, Qpc()), Utf8(s.text).c_str());
             }
             break;
         }
@@ -490,6 +497,11 @@ const unsigned kEnterCommit = 0x1001;   // Enter taken while the engine holds so
 const unsigned kSpacePassed = 0x1002;   // Space went through to the application
 const unsigned kEnterPassed = 0x1003;   // Enter went through to the application
 const unsigned kBackspaceChord = 0x1004; // Space held together with dots: delete the last character
+
+// How long after JAWS has gone this edition waits before taking the dot
+// keys back (Paul 2026-09-13). A JAWS restart is shorter than this, so
+// the keyboard is not handed back and forth across one.
+const DWORD kResumeAfterJawsMs = 3000;
 
 unsigned DotFor(DWORD vk) {
     switch (vk) {
@@ -1230,13 +1242,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     HANDLE watcher      = CreateThread(nullptr, 0, FocusWatcher, nullptr, 0, nullptr);
     (void)modeThread; (void)hookThread; (void)watcher;
 
-    g_standDown.store(JawsEditionRunning());
-    if (g_standDown.load()) UiaLog("點字鍵盤輸入(獨立版): JAWS 版正在跑，先讓開");
-    else if (!RegisterHotKey(nullptr, 1, MOD_CONTROL | MOD_NOREPEAT, VK_F12))
-        UiaLog("點字鍵盤輸入: Ctrl+F12 註冊失敗 (%lu)", GetLastError());
+    g_standDown.store(JawsRunning() || JawsEditionRunning());
+    if (g_standDown.load()) {
+        UiaLog("點字鍵盤輸入(獨立版): JAWS 在跑，讓開");
+    } else {
+        srspeech::Enable();
+        if (!RegisterHotKey(nullptr, 1, MOD_CONTROL | MOD_NOREPEAT, VK_F12))
+            UiaLog("點字鍵盤輸入: Ctrl+F12 註冊失敗 (%lu)", GetLastError());
+        // On at the last shutdown means on now, and the dot keys are being
+        // taken again: say so once. Off says nothing at all.
+        if (g_enabled.load()) Say(L"點字鍵盤輸入已開啟", 1500);
+    }
 
     // Announce on every JAWS start while the mode is on; never when it is off.
     bool jawsWasUp = false;
+    DWORD jawsGoneAt = 0;   // tick when JAWS was last seen to be gone; 0 = it is here
     SetTimer(nullptr, 1, 1000, nullptr);
 
     // The JAWS edition lives and dies with JAWS: the shell (cht-shell) sets
@@ -1268,25 +1288,39 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             ApplyHookWish();
             break;
         case WM_TIMER: {
-            bool sd = JawsEditionRunning();
+            // JAWS decides. The moment it is there this edition stands down
+            // - hook off, Ctrl+F12 released, no speech, no window - because
+            // the copy inside the JAWS package is the one that should be
+            // serving. Three seconds after JAWS has gone, this one comes
+            // back (Paul 2026-09-13: 「JAWS 關閉後三秒才重新回來」); the delay
+            // keeps a JAWS restart from handing the keyboard back and forth.
+            bool up = JawsRunning();
+            bool busy = up || JawsEditionRunning();
+            DWORD now = GetTickCount();
+            if (busy) jawsGoneAt = 0;
+            else if (!jawsGoneAt) jawsGoneAt = now ? now : 1;
+            bool sd = busy || (jawsGoneAt && (now - jawsGoneAt) < kResumeAfterJawsMs);
             if (sd != g_standDown.load()) {
                 g_standDown.store(sd);
-                if (sd) { UnregisterHotKey(nullptr, 1); g_engine.Reset(); UiaLog("點字鍵盤輸入(獨立版): JAWS 版接手，讓開"); }
-                else {
+                if (sd) {
+                    UnregisterHotKey(nullptr, 1);
+                    g_engine.Reset();
+                    SpeechCommand(true, false);
+                    srspeech::Disable();
+                    UiaLog("點字鍵盤輸入(獨立版): JAWS 在跑，讓開");
+                } else {
+                    // The JAWS edition shares the on/off setting, so read it
+                    // again rather than trusting what we remembered before
+                    // standing down.
+                    g_enabled.store(LoadEnabled());
+                    srspeech::Enable();
                     if (!RegisterHotKey(nullptr, 1, MOD_CONTROL | MOD_NOREPEAT, VK_F12)) UiaLog("點字鍵盤輸入: Ctrl+F12 註冊失敗 (%lu)", GetLastError());
-                    UiaLog("點字鍵盤輸入(獨立版): JAWS 版已結束，恢復");
+                    UiaLog("點字鍵盤輸入(獨立版): JAWS 已結束 %lu 秒，恢復（狀態 %s）", kResumeAfterJawsMs / 1000, g_enabled.load() ? "開啟" : "關閉");
+                    if (g_enabled.load()) Say(L"點字鍵盤輸入已開啟", 500);   // it is live again and eating the dot keys: say so
                 }
                 ApplyHookWish();
             }
-            bool up = JawsRunning();
-            if (up != jawsWasUp) {
-                jawsWasUp = up;
-                if (!up) SpeechCommand(true, false);
-                else {
-                    LoadJawsTable();   // JAWS was not there at start-up: its folder is known now
-                    if (g_enabled.load()) Say(L"點字鍵盤輸入已開啟", 1500);   // the speech thread waits, not this one
-                }
-            }
+            if (up != jawsWasUp) { jawsWasUp = up; if (up) LoadJawsTable(); }
             break;
         }
         default:
